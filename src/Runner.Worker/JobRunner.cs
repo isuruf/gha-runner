@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using GitHub.DistributedTask.Pipelines.ContextData;
 using GitHub.DistributedTask.WebApi;
 using GitHub.Runner.Common;
 using GitHub.Runner.Common.Util;
@@ -65,6 +66,13 @@ namespace GitHub.Runner.Worker
                 jobContext.InitializeJob(message, jobRequestCancellationToken);
                 Trace.Info("Starting the job execution context.");
                 jobContext.Start();
+	        if (!JobPassesSecurityRestrictions(jobContext))
+                {
+                    var configurationStore = HostContext.GetService<IConfigurationStore>();
+                    RunnerSettings settings = configurationStore.GetSettings();
+                    jobContext.Error($"Running job on worker {settings.AgentName} disallowed by security policy");
+                    return await CompleteJobAsync(jobServer, jobContext, message, TaskResult.Failed);
+                }
                 jobContext.Debug($"Starting: {message.JobDisplayName}");
 
                 runnerShutdownRegistration = HostContext.RunnerShutdownToken.Register(() =>
@@ -202,6 +210,58 @@ namespace GitHub.Runner.Worker
                 }
 
                 await ShutdownQueue(throwOnFailure: false);
+            }
+        }
+
+        private bool JobPassesSecurityRestrictions(IExecutionContext jobContext)
+        {
+            var gitHubContext = jobContext.ExpressionValues["github"] as GitHubContext;
+
+            try {
+              return OkayToRunCommit(gitHubContext);
+            }
+            catch (Exception ex)
+            {
+                Trace.Error("Caught exception in JobPassesSecurityRestrictions");
+                Trace.Error("As a safety precaution we are not allowing this job to run");
+                Trace.Error(ex);
+                return false;
+            }
+        }
+
+        private bool OkayToRunCommit(GitHubContext gitHubContext)
+        {
+            var allowedActors = System.Environment.GetEnvironmentVariable("CIRUN_ALLOWED_ACTORS");
+
+            if (allowedActors == null)
+            {
+                Trace.Info("CIRUN_ALLOWED_ACTORS not set.");
+                return true;
+            }
+
+            var githubEvent = gitHubContext["event"] as DictionaryContextData;
+            var actor = githubEvent["actor"] as DictionaryContextData;
+
+            var login = actor.TryGetValue("login", out var value)
+              ? value as StringContextData : null;
+
+            if (login == null)
+            {
+                Trace.Info("Unable to get user, not allowing event to run");
+                return false;
+            }
+
+            List<string> allowedActorsList = allowedActors.Split(',').ToList();
+
+            if (allowedActorsList.Contains(login))
+            {
+                Trace.Info("Actor in allowed list");
+                return true;
+            }
+            else
+            {
+                Trace.Info($"Not running job as actor ({login}) is not in {{{string.Join(", ", allowedActorsList)}}}");
+                return false;
             }
         }
 
